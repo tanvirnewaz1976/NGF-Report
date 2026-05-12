@@ -1,0 +1,287 @@
+(FileContent as binary, optional FileName as nullable text) as table =>
+let
+    _FileName = if FileName = null then "" else FileName,
+
+    ToText = (x as any) as nullable text =>
+        let
+            t0 = try Text.From(x) otherwise null,
+            t1 = if t0 = null then null
+                 else Text.Trim(Text.Replace(
+                        Text.Replace(t0, "#(lf)", " "), "#(cr)", " "))
+        in if t1 = "" then null else t1,
+
+    ToNumber = (x as any) as nullable number =>
+        let
+            t0 = ToText(x),
+            t1 = if t0 = null then null
+                 else Text.Replace(Text.Replace(t0, ",", ""), " ", ""),
+            n  = try Number.FromText(t1, "en-US") otherwise null
+        in n,
+
+    IsNumText = (t as nullable text) as logical =>
+        t <> null and (try Number.FromText(t, "en-US") otherwise null) <> null,
+
+    Is4DigitCode = (t as nullable text) as logical =>
+        t <> null and Text.Length(t) = 4
+        and (try Number.FromText(t, "en-US") otherwise null) <> null,
+
+    IsMainHead = (t as nullable text) as logical =>
+        Is4DigitCode(t) and Text.End(t, 2) = "00",
+
+    IsSubHead = (t as nullable text) as logical =>
+        Is4DigitCode(t) and Text.End(t, 2) <> "00",
+
+    IsExpCode = (t as nullable text) as logical =>
+        t <> null and (
+            Text.Start(t, 1) = "5" or
+            Text.Start(t, 1) = "6" or
+            Text.Start(t, 1) = "7"),
+
+    IsSubTotalText = (t as nullable text) as logical =>
+        t <> null and Text.Contains(
+            Text.Upper(Text.Replace(t, " ", "")), "SUBTOTAL"),
+
+    IsSkipRow = (t as nullable text) as logical =>
+        t <> null and (
+            Text.Contains(Text.Upper(Text.Replace(t, " ", "")), "GRANDTOTAL") or
+            Text.Contains(Text.Upper(Text.Replace(t, " ", "")), "SURPLUS") or
+            Text.Contains(Text.Upper(Text.Replace(t, " ", "")), "DEFICIT") or
+            (Text.Contains(Text.Upper(Text.Replace(t, " ", "")), "TOTAL")
+             and not Text.Contains(Text.Upper(Text.Replace(t, " ", "")), "SUBTOTAL"))),
+
+    Months     = {"January","February","March","April","May","June",
+                  "July","August","September","October","November","December"},
+    ShortMonths= {"Jan","Feb","Mar","Apr","May","Jun",
+                  "Jul","Aug","Sep","Oct","Nov","Dec"},
+    MonthNo    = (m as text) as number => List.PositionOf(Months, m) + 1,
+
+    // ── load PDF ──────────────────────────────────────────────────────────────
+    Source = try Pdf.Tables(FileContent, [Implementation = "1.3"])
+             otherwise Pdf.Tables(FileContent),
+
+    Tables0 = Table.SelectRows(Source,
+        each [Data] <> null and Value.Is([Data], type table)),
+
+    Tables = Table.AddIndexColumn(Tables0, "TableOrder", 1, 1, Int64.Type),
+
+    CellTextList = (tbl as table) as list =>
+        let d     = try Table.DemoteHeaders(tbl) otherwise tbl,
+            cells = List.Combine(Table.ToRows(d))
+        in List.RemoveNulls(List.Transform(cells, each ToText(_))),
+
+    WithText = Table.AddColumn(Tables, "AllText",
+        each Text.Combine(CellTextList([Data]), " "), type text),
+
+    AllDocText = Text.Combine(WithText[AllText], " "),
+
+    // ── metadata ──────────────────────────────────────────────────────────────
+    NameTokens = List.Select(Text.SplitAny(_FileName, " _-()."), each _ <> ""),
+
+    BranchCode = try List.First(List.Select(NameTokens,
+        each Text.Length(_) = 4 and IsNumText(_)
+          and Number.FromText(_, "en-US") >= 1
+          and Number.FromText(_, "en-US") < 1900))
+    otherwise null,
+
+    TakeUntilAny = (txt as nullable text, delims as list) as nullable text =>
+        if txt = null then null else
+        let
+            positions = List.RemoveNulls(List.Transform(delims, (d) =>
+                let p = Text.PositionOf(txt, d, Occurrence.First)
+                in if p >= 0 then p else null)),
+            cut = if List.Count(positions) > 0 then List.Min(positions)
+                  else Text.Length(txt),
+            out = Text.Trim(Text.Start(txt, cut))
+        in if out = "" then null else out,
+
+    AfterBranchCode =
+        if BranchCode <> null
+        then try Text.AfterDelimiter(AllDocText, BranchCode & ", ") otherwise null
+        else null,
+
+    BranchName = TakeUntilAny(AfterBranchCode,
+        {" Date:", " POMIS", " Nowabenki", " Noabenki", " Print", " SL "}),
+
+    AfterTo = try Text.Trim(Text.AfterDelimiter(AllDocText, " To ")) otherwise null,
+
+    EndDateText =
+        if AfterTo <> null
+        then Text.Trim(Text.Start(AfterTo,
+                let p = Text.PositionOf(AfterTo, " ", Occurrence.First)
+                in if p > 0 then p else Text.Length(AfterTo)))
+        else null,
+
+    ReportMonthFromDoc =
+        try
+            let parts  = Text.Split(EndDateText, "-"),
+                monIdx = List.PositionOf(ShortMonths, parts{1}),
+                yr     = Number.FromText(parts{2}, "en-US"),
+                mon    = if monIdx >= 0 then monIdx + 1 else error "bad month"
+            in Date.EndOfMonth(#date(yr, mon, 1))
+        otherwise null,
+
+    YearFromName = try List.Last(List.Select(NameTokens,
+        each Text.Length(_) = 4 and IsNumText(_)
+          and Number.FromText(_, "en-US") >= 1900))
+    otherwise null,
+
+    MonthFromName = try List.First(List.Select(Months,
+        (m) => Text.Contains(Text.Upper(_FileName), Text.Upper(m))))
+    otherwise null,
+
+    ReportMonthEnd =
+        if ReportMonthFromDoc <> null then ReportMonthFromDoc
+        else if YearFromName <> null and MonthFromName <> null
+        then Date.EndOfMonth(#date(
+                Number.FromText(YearFromName, "en-US"), MonthNo(MonthFromName), 1))
+        else null,
+
+    // ── normalise to 12 columns (handles wide side-by-side PDF tables) ────────
+    // Layout from Pdf.Tables when it extracts side-by-side:
+    // C1=SL_Exp  C2=Expenditure  C3=Month_Exp  C4=Year_Exp
+    // C5=SL_Inc  C6=Income       C7=Month_Inc  C8=Year_Inc
+    // (Sometimes only 4 cols when PDF splits into separate tables per page)
+    DataCols = List.Transform({1..12}, each "C" & Text.From(_)),
+
+    NormalizeTable = (tbl as table, tableOrder as number) as table =>
+        let
+            d = try Table.DemoteHeaders(tbl) otherwise tbl,
+            fixedRows = List.Transform(Table.ToRows(d), (r) =>
+                let txt    = List.Transform(r, each ToText(_)),
+                    padded = List.FirstN(List.Combine({txt, List.Repeat({null}, 12)}), 12)
+                in padded),
+            out     = Table.FromRows(fixedRows, DataCols),
+            withOrd = Table.AddColumn(out, "PdfTableOrder", each tableOrder, Int64.Type),
+            withRow = Table.AddIndexColumn(withOrd, "PdfRowOrder", 1, 1, Int64.Type)
+        in withRow,
+
+    WithTextU = Table.AddColumn(WithText, "AllTextU",
+        each Text.Upper(Text.Replace([AllText], " ", "")), type text),
+
+    ExpTables = Table.SelectRows(WithTextU,
+        each Text.Contains([AllTextU], "EXPENDITURE")
+          or Text.Contains([AllText], "5000")
+          or Text.Contains([AllTextU], "POMIS-4")),
+
+    UseTables = if Table.RowCount(ExpTables) > 0 then ExpTables else WithTextU,
+
+    RowTables = List.Transform(Table.ToRecords(UseTables),
+        each NormalizeTable(_[Data], _[TableOrder])),
+
+    Rows0 = if List.Count(RowTables) = 0
+            then #table(DataCols & {"PdfTableOrder","PdfRowOrder"}, {})
+            else Table.Combine(RowTables),
+
+    WithGlobalOrder = Table.AddIndexColumn(Rows0, "GlobalRowOrder", 1, 1, Int64.Type),
+
+    AddCells = Table.AddColumn(WithGlobalOrder, "Cells",
+        each List.Transform(
+                Record.ToList(Record.SelectFields(_, DataCols)),
+                (v) => ToText(v))),
+
+    // ── detect actual column count used in this PDF ───────────────────────────
+    // Count non-null cells per row to determine if 4-col or 8-col layout
+    // Expenditure is ALWAYS in the LEFT half: idx0=SL, idx1=AcctText, idx2=Month, idx3=Year
+    ParseAccountText = (raw as nullable text) as record =>
+        let tx       = ToText(raw),
+            hasComma = tx <> null and Text.Contains(tx, ","),
+            before   = if hasComma then Text.Trim(Text.BeforeDelimiter(tx, ",")) else null,
+            after    = if hasComma then Text.Trim(Text.AfterDelimiter(tx, ",")) else null,
+            code     = if before <> null and Is4DigitCode(before) then before
+                       else if Is4DigitCode(tx) then tx else null,
+            name     = if before <> null and Is4DigitCode(before) then after
+                       else if Is4DigitCode(tx) then null else tx
+        in [Code = code, Name = name],
+
+    AddParsed = Table.AddColumn(AddCells, "ParsedRow",
+        each
+            let
+                cells    = [Cells],
+                // Expenditure always in LEFT columns (idx 0-3)
+                acctRaw  = try cells{1} otherwise null,
+                monthRaw = try cells{2} otherwise null,
+                yearRaw  = try cells{3} otherwise null,
+
+                isSubTot = IsSubTotalText(acctRaw),
+                isSkip   = IsSkipRow(acctRaw),
+                parsed   = ParseAccountText(acctRaw),
+                code     = parsed[Code],
+                name     = parsed[Name],
+                isExp    = IsExpCode(code),
+
+                rowType =
+                    if isSkip               then "Skip"
+                    else if isSubTot        then "SubTotal"
+                    else if isExp and IsMainHead(code) then "MainHeader"
+                    else if isExp and IsSubHead(code)  then "SubAccount"
+                    else null
+            in
+                [
+                    GlobalRowOrder = [GlobalRowOrder],
+                    AccountCode    = code,
+                    AccountName    = name,
+                    RowType        = rowType,
+                    AmountForMonth = ToNumber(monthRaw),
+                    AmountForYear  = ToNumber(yearRaw)
+                ]),
+
+    ParsedTable = Table.FromRecords(AddParsed[ParsedRow]),
+    CleanRows   = Table.SelectRows(ParsedTable,
+        each [RowType] <> null and [RowType] <> "Skip"),
+
+    AddMainCode = Table.AddColumn(CleanRows, "MainAccountCode",
+        each if [RowType] = "MainHeader" then [AccountCode] else null,
+        type nullable text),
+    AddMainName = Table.AddColumn(AddMainCode, "MainAccountName",
+        each if [RowType] = "MainHeader" then [AccountName] else null,
+        type nullable text),
+
+    SortedRows = Table.Sort(AddMainName, {{"GlobalRowOrder", Order.Ascending}}),
+    FilledMain = Table.FillDown(SortedRows, {"MainAccountCode","MainAccountName"}),
+
+    DataRows = Table.SelectRows(FilledMain,
+        each [RowType] = "SubAccount" or [RowType] = "SubTotal"),
+
+    AddSubCode = Table.AddColumn(DataRows, "SubAccountCode",
+        each if [RowType] = "SubAccount" then [AccountCode] else null,
+        type nullable text),
+    AddSubName = Table.AddColumn(AddSubCode, "SubAccountName",
+        each if [RowType] = "SubAccount" then [AccountName] else "Sub Total",
+        type nullable text),
+
+    Records = List.Transform(Table.ToRecords(AddSubName), (r) => [
+        SourceFile      = _FileName,
+        BranchCode      = BranchCode,
+        BranchName      = BranchName,
+        ReportMonthEnd  = ReportMonthEnd,
+        Side            = "Expenditure",
+        MainAccountCode = r[MainAccountCode],
+        MainAccountName = r[MainAccountName],
+        SubAccountCode  = r[SubAccountCode],
+        SubAccountName  = r[SubAccountName],
+        RowType         = r[RowType],
+        AmountForMonth  = r[AmountForMonth],
+        AmountForYear   = r[AmountForYear]
+    ]),
+
+    Result0 =
+        if List.Count(Records) = 0
+        then #table(type table [
+            SourceFile=text, BranchCode=nullable text, BranchName=nullable text,
+            ReportMonthEnd=nullable date, Side=text,
+            MainAccountCode=nullable text, MainAccountName=nullable text,
+            SubAccountCode=nullable text, SubAccountName=nullable text,
+            RowType=text, AmountForMonth=nullable number, AmountForYear=nullable number
+        ], {})
+        else Table.FromRecords(Records),
+
+    ChangedType = Table.TransformColumnTypes(Result0, {
+        {"SourceFile", type text}, {"BranchCode", type text},
+        {"BranchName", type text}, {"ReportMonthEnd", type date},
+        {"Side", type text}, {"MainAccountCode", type text},
+        {"MainAccountName", type text}, {"SubAccountCode", type text},
+        {"SubAccountName", type text}, {"RowType", type text},
+        {"AmountForMonth", type number}, {"AmountForYear", type number}
+    })
+in
+    ChangedType
