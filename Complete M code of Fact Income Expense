@@ -1,0 +1,72 @@
+let
+    FolderPath = "C:\Users\ASUS\OneDrive\Desktop\NGF Monthly Meeting Report\Income Expense NGF",
+    Source  = Folder.Files(FolderPath),
+    OnlyPDF = Table.SelectRows(Source, each Text.Lower([Extension]) = ".pdf"),
+
+    OutputCols = {
+        "SourceFile","BranchCode","BranchName","ReportMonthEnd",
+        "Side","MainAccountCode","MainAccountName",
+        "SubAccountCode","SubAccountName",
+        "RowType","AmountForMonth","AmountForYear"
+    },
+
+    AddExp = Table.AddColumn(OnlyPDF, "ExpData", each fxPOMIS4_Expenditure([Content], [Name]), type table),
+    ExpandedExp = Table.ExpandTableColumn(AddExp, "ExpData", OutputCols, OutputCols),
+    ExpOnly = Table.SelectRows(Table.SelectColumns(ExpandedExp, OutputCols), each [Side] = "Expenditure"),
+
+    AddInc = Table.AddColumn(OnlyPDF, "IncData", each fxPOMIS4_Income([Content], [Name]), type table),
+    ExpandedInc = Table.ExpandTableColumn(AddInc, "IncData", OutputCols, OutputCols),
+    IncOnly = Table.SelectRows(Table.SelectColumns(ExpandedInc, OutputCols), each [Side] = "Income"),
+
+    Combined = Table.Combine({ExpOnly, IncOnly}),
+
+    // 1) Remove exact duplicate rows first
+    DistinctRows = Table.Distinct(Combined),
+
+    // 2) For logical duplicates (same account appears twice with partial null amounts),
+    //    keep one row and take the non-null / max amount values.
+    GroupKeys = {
+        "SourceFile","BranchCode","BranchName","ReportMonthEnd",
+        "Side","MainAccountCode","MainAccountName",
+        "SubAccountCode","SubAccountName","RowType"
+    },
+
+    Grouped = Table.Group(
+        DistinctRows,
+        GroupKeys,
+        {
+            {"AmountForMonth", each List.Max(List.RemoveNulls([AmountForMonth])), type nullable number},
+            {"AmountForYear", each List.Max(List.RemoveNulls([AmountForYear])), type nullable number}
+        }
+    ),
+
+    // 3) Keep only meaningful subtotal rows
+    FilteredRows = Table.SelectRows(
+        Grouped,
+        each [RowType] = "SubTotal" and [MainAccountName] <> null
+    ),
+
+    Sorted = Table.Sort(FilteredRows, {
+        {"ReportMonthEnd",  Order.Ascending},
+        {"BranchCode",      Order.Ascending},
+        {"Side",            Order.Ascending},
+        {"MainAccountCode", Order.Ascending},
+        {"SubAccountCode",  Order.Ascending}
+    }),
+
+    ChangedType = Table.TransformColumnTypes(Sorted, {
+        {"SourceFile",      type text},
+        {"BranchCode",      type text},
+        {"BranchName",      type text},
+        {"ReportMonthEnd",  type date},
+        {"Side",            type text},
+        {"MainAccountCode", type text},
+        {"MainAccountName", type text},
+        {"SubAccountCode",  type text},
+        {"SubAccountName",  type text},
+        {"RowType",         type text},
+        {"AmountForMonth",  type number},
+        {"AmountForYear",   type number}
+    })
+in
+    ChangedType
